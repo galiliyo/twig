@@ -20,7 +20,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from core.extractor import extract
 from core.wisemapping import WiseMapping, WiseMappingError
-from core.ai import choose_placement
+from core.ai import choose_placement, summarize_bullets
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +41,9 @@ _force_pending: dict[int, str] = {}
 
 async def _save_item(text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Extract, place, and save a single item. Replies with result or error."""
+    message = update.effective_message
+    if message is None:
+        return
     _in_flight.add(text)
     wm: WiseMapping = context.bot_data["wm"]
     try:
@@ -49,8 +52,17 @@ async def _save_item(text: str, update: Update, context: ContextTypes.DEFAULT_TY
         placement = await choose_placement(branches, item)
 
         placement.url = item.url
-        placement.note = item.summary.strip() if item.summary else None
-        log.info("placement.url=%r  note_len=%s", placement.url, len(placement.note) if placement.note else 0)
+        # Try to summarize the raw content into bullets; fall back to truncated raw text on failure
+        bullets = await summarize_bullets(item.summary, title=item.title) if item.summary else None
+        if bullets:
+            placement.note = bullets
+            log.info("placement.url=%r  note_len=%s (bulleted)", placement.url, len(placement.note))
+        elif item.summary:
+            placement.note = item.summary.strip()[:1000]
+            log.info("placement.url=%r  note_len=%s (raw fallback)", placement.url, len(placement.note))
+        else:
+            placement.note = None
+            log.info("placement.url=%r  note_len=0", placement.url)
         saved_path = await wm.add_node(placement)
 
         _recent.append(text)
@@ -59,16 +71,16 @@ async def _save_item(text: str, update: Update, context: ContextTypes.DEFAULT_TY
 
         note_preview = f"\n📝 {len(placement.note)}c: {placement.note[:80]}" if placement.note else "\n📝 (no note)"
         log.info("Saved: %s", saved_path)
-        await update.message.reply_text(f"✓ Saved to {saved_path}{note_preview}")
+        await message.reply_text(f"✓ Saved to {saved_path}{note_preview}")
 
     except WiseMappingError as exc:
         log.error("WiseMapping error: %s", exc)
         msg = "Could not authenticate with WiseMapping" if "auth" in str(exc).lower() else "Could not save map update"
-        await update.message.reply_text(f"❌ {msg}")
+        await message.reply_text(f"❌ {msg}")
 
     except Exception as exc:
         log.exception("Unexpected error: %s", exc)
-        await update.message.reply_text("❌ Something went wrong")
+        await message.reply_text("❌ Something went wrong")
 
     finally:
         _in_flight.discard(text)
@@ -78,25 +90,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
-    text = (update.message.text or "").strip()
+    message = update.effective_message
+    if message is None:
+        return
+
+    text = (message.text or "").strip()
     if not text:
         return
 
     # "force" reply to a duplicate warning → bypass duplicate check
-    if text.lower() == "force" and update.message.reply_to_message:
-        original = _force_pending.pop(update.message.reply_to_message.message_id, None)
+    if text.lower() == "force" and message.reply_to_message:
+        original = _force_pending.pop(message.reply_to_message.message_id, None)
         if original:
             log.info("Force-saving: %r", original[:120])
             await _save_item(original, update, context)
         else:
-            await update.message.reply_text("Nothing to force-save (warning expired or already saved).")
+            await message.reply_text("Nothing to force-save (warning expired or already saved).")
         return
 
     log.info("Received message: %r", text[:120])
 
     # Early duplicate check — catches repeated sends before expensive Exa/AI calls
     if text in _in_flight or text in _recent:
-        warning = await update.message.reply_text("↺ Already processing or recently saved — reply force to save anyway")
+        warning = await message.reply_text("↺ Already processing or recently saved — reply force to save anyway")
         _force_pending[warning.message_id] = text
         return
 
@@ -107,9 +123,13 @@ async def testnote_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
+    message = update.effective_message
+    if message is None:
+        return
+
     args = context.args
     if not args:
-        await update.message.reply_text("Usage: /testnote <url>")
+        await message.reply_text("Usage: /testnote <url>")
         return
 
     url = args[0]
@@ -149,11 +169,97 @@ async def testnote_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     else:
         lines.append("Exa: skipped (no key)")
 
-    await update.message.reply_text("\n".join(lines)[:4000])
+    await message.reply_text("\n".join(lines)[:4000])
+
+
+async def testmedium_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.info("/testmedium received from user_id=%s", update.effective_user.id)
+    if update.effective_user.id != ALLOWED_USER_ID:
+        log.warning("/testmedium dropped — user_id mismatch (allowed=%s)", ALLOWED_USER_ID)
+        return
+
+    message = update.effective_message
+    if message is None:
+        log.warning("/testmedium: effective_message is None")
+        return
+
+    args = context.args
+    if not args:
+        await message.reply_text("Usage: /testmedium <url>")
+        return
+
+    url = args[0]
+    log.info("/testmedium: starting for %s", url)
+    lines = [f"Testing paywall fetch: {url}\n"]
+
+    # Step 1: httpx GET + paywall detection
+    from core.extractor import _is_paywalled, _fetch_with_playwright
+    try:
+        async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        lines.append(f"Direct HTTP: {resp.status_code}, {len(resp.text)} chars")
+        paywalled = _is_paywalled(resp.text) if resp.status_code == 200 else False
+        lines.append(f"Paywall detected: {paywalled}")
+        if paywalled:
+            if '"isAccessibleForFree":false' in resp.text.replace(" ", "").replace("\n", ""):
+                lines.append("  signal: schema.org isAccessibleForFree=false")
+            import re as _re
+            if _re.search(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']Medium', resp.text, _re.I):
+                lines.append("  signal: Medium generator meta tag")
+    except Exception as exc:
+        lines.append(f"Direct HTTP error: {exc}")
+        paywalled = False
+
+    # Step 2: playwright import
+    try:
+        from playwright.async_api import async_playwright  # noqa: F401
+        lines.append("✓ Playwright importable")
+    except ImportError as exc:
+        lines.append(f"✗ Playwright not installed: {exc}")
+        await message.reply_text("\n".join(lines)[:4000])
+        return
+
+    # Step 3: cookies file
+    import json
+    cookie_path = os.environ.get("MEDIUM_COOKIES_PATH", "medium_cookies.json")
+    try:
+        with open(cookie_path) as f:
+            cookies = json.load(f)
+        lines.append(f"✓ Cookies loaded from {cookie_path} ({len(cookies)} cookies)")
+        medium_cookies = [c for c in cookies if "medium.com" in c.get("domain", "")]
+        lines.append(f"  of which {len(medium_cookies)} are *.medium.com cookies")
+    except FileNotFoundError:
+        lines.append(f"✗ Cookies file not found at {cookie_path}")
+        await message.reply_text("\n".join(lines)[:4000])
+        return
+    except Exception as exc:
+        lines.append(f"✗ Cookies file parse error: {exc}")
+        await message.reply_text("\n".join(lines)[:4000])
+        return
+
+    # Step 4: actual Playwright fetch
+    log.info("/testmedium: launching Playwright fetch")
+    try:
+        title, summary = await _fetch_with_playwright(url)
+        log.info("/testmedium: playwright returned title=%r summary_len=%s", title, len(summary) if summary else 0)
+        lines.append(f"\nTitle: {title!r}")
+        lines.append(f"Summary length: {len(summary) if summary else 0}")
+        if summary:
+            lines.append(f"\nSummary preview:\n{summary[:400]}")
+        else:
+            lines.append("Summary: EMPTY")
+    except Exception as exc:
+        log.exception("/testmedium: fetch raised")
+        lines.append(f"✗ Fetch raised: {type(exc).__name__}: {exc}")
+
+    await message.reply_text("\n".join(lines)[:4000])
 
 
 async def showxml_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ALLOWED_USER_ID:
+        return
+    message = update.effective_message
+    if message is None:
         return
     wm: WiseMapping = context.bot_data["wm"]
     try:
@@ -165,27 +271,33 @@ async def showxml_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         for t in topics[-2:]:
             raw = ET.tostring(t, encoding="unicode")
             lines.append(raw[:800])
-        await update.message.reply_text("\n\n".join(lines)[:4000])
+        await message.reply_text("\n\n".join(lines)[:4000])
     except Exception as exc:
-        await update.message.reply_text(f"❌ {exc}")
+        await message.reply_text(f"❌ {exc}")
 
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.info("/debug received from user_id=%s (allowed=%s)", update.effective_user.id, ALLOWED_USER_ID)
     if update.effective_user.id != ALLOWED_USER_ID:
+        log.warning("/debug dropped — user_id mismatch")
+        return
+
+    message = update.effective_message
+    if message is None:
         return
 
     wm: WiseMapping = context.bot_data["wm"]
     try:
         branches = await wm.get_branches()
         if not branches:
-            await update.message.reply_text("⚠️ No branches found (empty map or parse error)")
+            await message.reply_text("⚠️ No branches found (empty map or parse error)")
             return
         lines = "\n".join(f"• {b}" for b in branches)
         if len(lines) > 4000:
             lines = lines[:4000] + "\n…(truncated)"
-        await update.message.reply_text(f"🗺 Branches ({len(branches)}):\n\n{lines}")
+        await message.reply_text(f"🗺 Branches ({len(branches)}):\n\n{lines}")
     except WiseMappingError as exc:
-        await update.message.reply_text(f"❌ {exc}")
+        await message.reply_text(f"❌ {exc}")
 
 
 async def post_init(app) -> None:
@@ -212,6 +324,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("debug", debug_command))
     app.add_handler(CommandHandler("testnote", testnote_command))
+    app.add_handler(CommandHandler("testmedium", testmedium_command))
     app.add_handler(CommandHandler("showxml", showxml_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("Twig bot starting (polling)…")

@@ -71,7 +71,7 @@ class WiseMapping:
 
         if placement.note:
             note_el = ET.SubElement(leaf, "note")
-            note_el.text = placement.note
+            note_el.set("text", placement.note)
 
         _assign_positions(root)
         await self._save_xml(ET.tostring(root, encoding="unicode", xml_declaration=False))
@@ -121,7 +121,12 @@ class WiseMapping:
 # ── XML helpers ───────────────────────────────────────────────────────────────
 
 def _flatten_branches(root: ET.Element) -> list[str]:
-    """BFS over all topics; return paths like 'Branch > Sub-branch'."""
+    """BFS over topics; return paths for CATEGORY nodes only.
+
+    A category is a topic without a <link url=.../> child. Topics with a link
+    are saved articles (leaves) and must not be offered as placement targets —
+    otherwise the AI will nest new items under an existing article.
+    """
     central = root.find(".//topic[@central='true']") or root.find(".//topic")
     if central is None:
         return []
@@ -135,6 +140,9 @@ def _flatten_branches(root: ET.Element) -> list[str]:
 
     while queue:
         node, path = queue.popleft()
+        # Skip saved articles (have a URL link) — they're leaves, not categories
+        if node.find("link") is not None:
+            continue
         paths.append(" > ".join(path))
         for child in node:
             if child.tag == "topic":

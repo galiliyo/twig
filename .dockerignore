@@ -1,0 +1,16 @@
+.git
+.gitignore
+.claude
+.remember
+.serena
+.env
+medium_cookies.json
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.venv
+venv
+README.md
+claude.md
+CLAUDE.md

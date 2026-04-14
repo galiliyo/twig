@@ -25,3 +25,5 @@ core/ai.py          OpenRouter call — returns branch_path + title for new node
 - **Force-save**: user replies `force` to the duplicate warning message to bypass duplicate check
 - **Exa + paywalls**: Medium and similar return preview only (~150 words); full content for non-paywalled sites
 - **WiseMapping notes**: rendered as a small icon on the node — must click to read, not shown inline
+- **WiseMapping note XML format**: `<note text="content"/>` as attribute — NOT `<note>content</note>` as element text (WiseMapping UI only reads the `text` attr)
+- **Medium/paywalled extraction**: httpx 403 → escalate to Playwright with saved cookies (`medium_cookies.json`) + stealth init script to bypass Cloudflare bot detection
