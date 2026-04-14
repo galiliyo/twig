@@ -1,0 +1,6 @@
+python-telegram-bot==21.*
+httpx
+beautifulsoup4
+lxml
+python-dotenv
+exa-py
