@@ -9,10 +9,10 @@ python bot.py
 ## Architecture
 
 ```
-bot.py              Telegram polling, duplicate guard, force-save flow
-core/extractor.py   Input type detection, HTTP fetch, Exa fallback for blocked sites
-core/wisemapping.py WiseMapping JWT auth, XML read/write, node placement
-core/ai.py          OpenRouter call — returns branch_path + title for new node
+bot.py              Telegram polling, duplicate guard, force-save flow, /replace command
+core/extractor.py   Input type detection, HTTP fetch, yt-dlp for YouTube, Exa fallback
+core/wisemapping.py WiseMapping JWT auth, XML read/write, node placement + move
+core/ai.py          OpenRouter call — placement, relocation, and summarization
 ```
 
 ## Gotchas
@@ -27,3 +27,6 @@ core/ai.py          OpenRouter call — returns branch_path + title for new node
 - **WiseMapping notes**: rendered as a small icon on the node — must click to read, not shown inline
 - **WiseMapping note XML format**: `<note text="content"/>` as attribute — NOT `<note>content</note>` as element text (WiseMapping UI only reads the `text` attr)
 - **Medium/paywalled extraction**: httpx 403 → escalate to Playwright with saved cookies (`medium_cookies.json`) + stealth init script to bypass Cloudflare bot detection
+- **YouTube extraction**: yt-dlp extracts title + description (channel info included); falls back to `_fetch_page` on failure
+- **/replace flow**: reply-based — bot shows numbered top-level branches, user replies with number, bot AI picks 2nd-level leaf and moves the node
+- **`_last_saved` state**: in-memory dict tracking the most recent save for `/replace` — lost on restart

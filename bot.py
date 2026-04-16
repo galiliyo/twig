@@ -20,7 +20,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from core.extractor import extract
 from core.wisemapping import WiseMapping, WiseMappingError
-from core.ai import choose_placement, summarize_bullets
+from core.ai import choose_placement, choose_relocation, summarize_bullets
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,6 +37,12 @@ _in_flight: set[str] = set()
 
 # Maps bot warning message_id → original user text, so "force" replies work
 _force_pending: dict[int, str] = {}
+
+# Last saved item — used by /replace to know what to move
+_last_saved: dict | None = None  # {branch_path, title, url, note}
+
+# Maps bot /replace message_id → list of top-level branch names, so numbered reply works
+_replace_pending: dict[int, list[str]] = {}
 
 
 async def _save_item(text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -69,6 +75,15 @@ async def _save_item(text: str, update: Update, context: ContextTypes.DEFAULT_TY
         if len(_recent) > _RECENT_MAX:
             _recent.pop(0)
 
+        # Track last saved item for /replace
+        global _last_saved
+        _last_saved = {
+            "branch_path": list(placement.branch_path) + ([placement.new_branch] if placement.new_branch else []),
+            "title": placement.title,
+            "url": placement.url,
+            "note": placement.note,
+        }
+
         note_preview = f"\n📝 {len(placement.note)}c: {placement.note[:80]}" if placement.note else "\n📝 (no note)"
         log.info("Saved: %s", saved_path)
         await message.reply_text(f"✓ Saved to {saved_path}{note_preview}")
@@ -84,6 +99,97 @@ async def _save_item(text: str, update: Update, context: ContextTypes.DEFAULT_TY
 
     finally:
         _in_flight.discard(text)
+
+
+async def replace_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show top-level branches so user can relocate the last saved item."""
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+    message = update.effective_message
+    if message is None:
+        return
+
+    if _last_saved is None:
+        await message.reply_text("No recently saved item to replace.")
+        return
+
+    wm: WiseMapping = context.bot_data["wm"]
+    try:
+        top_branches = await wm.get_top_level_branches()
+    except WiseMappingError as exc:
+        await message.reply_text(f"❌ {exc}")
+        return
+
+    if not top_branches:
+        await message.reply_text("No branches found in the map.")
+        return
+
+    old_path = " > ".join(_last_saved["branch_path"] + [_last_saved["title"]])
+    lines = [f"Moving: {_last_saved['title']}", f"Currently at: {old_path}", "", "Pick a top-level branch:"]
+    for i, branch in enumerate(top_branches, 1):
+        lines.append(f"  {i}. {branch}")
+    lines.append("\nReply with the number.")
+
+    listing = await message.reply_text("\n".join(lines))
+    _replace_pending[listing.message_id] = top_branches
+
+
+async def _handle_replace_choice(
+    choice: int,
+    top_branches: list[str],
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Relocate the last saved item under the chosen top-level branch."""
+    global _last_saved
+    message = update.effective_message
+    if message is None:
+        return
+
+    if _last_saved is None:
+        await message.reply_text("No recently saved item to replace.")
+        return
+
+    if choice < 1 or choice > len(top_branches):
+        await message.reply_text(f"Pick a number between 1 and {len(top_branches)}.")
+        return
+
+    chosen = top_branches[choice - 1]
+    wm: WiseMapping = context.bot_data["wm"]
+
+    try:
+        sub_branches = await wm.get_sub_branches(chosen)
+        new_placement = await choose_relocation(
+            top_level=chosen,
+            sub_branches=sub_branches,
+            item_title=_last_saved["title"],
+            item_url=_last_saved["url"],
+            item_note=_last_saved["note"],
+        )
+
+        new_path = await wm.move_node(
+            old_path=_last_saved["branch_path"],
+            old_title=_last_saved["title"],
+            new_placement=new_placement,
+        )
+
+        # Update last_saved to reflect new location
+        _last_saved = {
+            "branch_path": list(new_placement.branch_path) + ([new_placement.new_branch] if new_placement.new_branch else []),
+            "title": new_placement.title,
+            "url": new_placement.url or _last_saved.get("url"),
+            "note": new_placement.note or _last_saved.get("note"),
+        }
+
+        log.info("Relocated to: %s", new_path)
+        await message.reply_text(f"✓ Moved to {new_path}")
+
+    except WiseMappingError as exc:
+        log.error("WiseMapping error during replace: %s", exc)
+        await message.reply_text(f"❌ Could not move: {exc}")
+    except Exception as exc:
+        log.exception("Replace failed: %s", exc)
+        await message.reply_text(f"❌ Something went wrong: {exc}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -107,6 +213,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             await message.reply_text("Nothing to force-save (warning expired or already saved).")
         return
+
+    # Numbered reply to a /replace listing → relocate the last saved item
+    if text.isdigit() and message.reply_to_message:
+        branches = _replace_pending.pop(message.reply_to_message.message_id, None)
+        if branches:
+            await _handle_replace_choice(int(text), branches, update, context)
+            return
 
     log.info("Received message: %r", text[:120])
 
@@ -322,6 +435,7 @@ def main() -> None:
     wm = WiseMapping()
     app.bot_data["wm"] = wm
 
+    app.add_handler(CommandHandler("replace", replace_command))
     app.add_handler(CommandHandler("debug", debug_command))
     app.add_handler(CommandHandler("testnote", testnote_command))
     app.add_handler(CommandHandler("testmedium", testmedium_command))

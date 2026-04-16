@@ -78,6 +78,85 @@ async def choose_placement(branches: list[str], item: ExtractedInput) -> Placeme
     )
 
 
+_RELOCATE_SYSTEM = """\
+You are a mind-map placement assistant.
+The user has decided an item belongs under a specific top-level branch.
+Given the sub-branches under that branch and the item description,
+return a JSON object:
+
+{
+  "branch_path": ["TopLevel", "SubBranch"],  // full path from top-level down
+  "new_branch": null,                        // or a short label if a new sub-branch is needed
+  "title": "Same title as before"            // keep the original title unchanged
+}
+
+Rules:
+- The first element of branch_path MUST be the given top-level branch.
+- Prefer existing sub-branches. Create new_branch only as a last resort.
+- Keep the original title exactly as given.
+- Respond with valid JSON only, no prose.
+"""
+
+
+async def choose_relocation(
+    top_level: str,
+    sub_branches: list[str],
+    item_title: str,
+    item_url: str | None,
+    item_note: str | None,
+) -> Placement:
+    """Choose a 2nd-level placement under a forced top-level branch."""
+    parts = [f"title={item_title!r}"]
+    if item_url:
+        parts.append(f"url={item_url}")
+    if item_note:
+        snippet = item_note[:400].replace("\n", " ").strip()
+        parts.append(f"note_preview={snippet!r}")
+    description = ", ".join(parts)
+
+    branches_text = "\n".join(sub_branches) if sub_branches else "(no existing sub-branches)"
+    user_msg = (
+        f"Top-level branch: {top_level}\n"
+        f"Sub-branches:\n{branches_text}\n\n"
+        f"Item: {description}"
+    )
+
+    payload = {
+        "model": os.environ["OPENROUTER_MODEL"],
+        "messages": [
+            {"role": "system", "content": _RELOCATE_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": 0.2,
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(
+            _OPENROUTER_URL,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
+                "HTTP-Referer": "https://github.com/galiliyo/twig",
+            },
+        )
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenRouter error: HTTP {resp.status_code} — {resp.text}")
+
+    content = resp.json()["choices"][0]["message"]["content"].strip()
+    if content.startswith("```"):
+        content = content.split("```")[1]
+        if content.startswith("json"):
+            content = content[4:]
+
+    data = json.loads(content)
+    return Placement(
+        branch_path=data["branch_path"],
+        new_branch=data.get("new_branch"),
+        title=data["title"],
+    )
+
+
 _SUMMARIZE_SYSTEM = """\
 You summarize articles for a personal knowledge mind-map.
 

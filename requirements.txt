@@ -4,4 +4,5 @@ beautifulsoup4
 lxml
 python-dotenv
 exa-py
+yt-dlp
 playwright==1.48.0

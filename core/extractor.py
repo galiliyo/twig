@@ -35,7 +35,7 @@ _REMINDER_RE = re.compile(r"\bremind(?:er| me)?\b", re.IGNORECASE)
 async def extract(text: str) -> ExtractedInput:
     if m := _YOUTUBE_RE.search(text):
         url = m.group(0)
-        title, summary = await _fetch_page(url)
+        title, summary = await _fetch_youtube(url)
         return ExtractedInput(type=InputType.YOUTUBE, raw=text, url=url, title=title, summary=summary)
 
     if m := _URL_RE.search(text):
@@ -239,3 +239,50 @@ def _title_from_url(url: str) -> str | None:
         return title.title() if title else None
     except Exception:
         return None
+
+
+async def _fetch_youtube(url: str) -> tuple[str | None, str | None]:
+    """Extract YouTube video title + description via yt-dlp (no API key needed).
+
+    Falls back to regular _fetch_page if yt-dlp fails.
+    """
+    try:
+        import yt_dlp
+
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "extract_flat": False,
+        }
+
+        info = await asyncio.to_thread(_yt_dlp_extract, url, ydl_opts)
+        if info is None:
+            _log.warning("yt-dlp returned no info for %s, falling back", url)
+            return await _fetch_page(url)
+
+        title = info.get("title")
+        channel = info.get("channel") or info.get("uploader")
+        description = (info.get("description") or "").strip()
+
+        # Build a rich summary: channel + description, capped at limit
+        parts = []
+        if channel:
+            parts.append(f"Channel: {channel}")
+        if description:
+            parts.append(description)
+        summary = "\n\n".join(parts)[:_MAX_SUMMARY_CHARS] if parts else None
+
+        _log.info("yt-dlp: title=%r channel=%r desc_len=%s", title, channel, len(description))
+        return title, summary
+
+    except Exception as exc:
+        _log.warning("yt-dlp failed for %s: %s — falling back to _fetch_page", url, exc)
+        return await _fetch_page(url)
+
+
+def _yt_dlp_extract(url: str, opts: dict) -> dict | None:
+    """Synchronous yt-dlp extraction (run in thread)."""
+    import yt_dlp
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)

@@ -82,6 +82,84 @@ class WiseMapping:
         parts.append(placement.title)
         return " > ".join(parts)
 
+    async def get_top_level_branches(self) -> list[str]:
+        """Return the names of all direct children of the central node (top-level categories)."""
+        xml_text = await self._fetch_xml()
+        root = ET.fromstring(xml_text)
+        central = root.find(".//topic[@central='true']") or root.find(".//topic")
+        if central is None:
+            return []
+        return [c.get("text", "") for c in central if c.tag == "topic"]
+
+    async def get_sub_branches(self, top_level: str) -> list[str]:
+        """Return 'TopLevel > Child' paths for all category children under a top-level branch."""
+        xml_text = await self._fetch_xml()
+        root = ET.fromstring(xml_text)
+        central = root.find(".//topic[@central='true']") or root.find(".//topic")
+        if central is None:
+            return []
+        parent = next((c for c in central if c.tag == "topic" and c.get("text") == top_level), None)
+        if parent is None:
+            return []
+        paths = []
+        for child in parent:
+            if child.tag == "topic" and child.find("link") is None:
+                paths.append(f"{top_level} > {child.get('text', '')}")
+        return paths
+
+    async def move_node(self, old_path: list[str], old_title: str, new_placement: 'Placement') -> str:
+        """Remove a leaf node at old_path/old_title and add it at new_placement. Returns new display path."""
+        xml_text = await self._fetch_xml()
+        root = ET.fromstring(xml_text)
+
+        # Find and detach the old node
+        old_parent = _find_topic(root, old_path)
+        if old_parent is not None:
+            for child in list(old_parent):
+                if child.tag == "topic" and child.get("text") == old_title:
+                    old_parent.remove(child)
+                    # Preserve URL and note from old node if not set on new placement
+                    if new_placement.url is None:
+                        link_el = child.find("link")
+                        if link_el is not None:
+                            new_placement.url = link_el.get("url")
+                    if new_placement.note is None:
+                        note_el = child.find("note")
+                        if note_el is not None:
+                            new_placement.note = note_el.get("text")
+                    break
+
+        # Add to new location
+        target = _find_or_create_path(root, new_placement.branch_path)
+
+        if new_placement.new_branch:
+            mid = ET.SubElement(target, "topic")
+            mid.set("id", str(_next_id(root)))
+            mid.set("text", new_placement.new_branch)
+            target = mid
+
+        leaf = ET.SubElement(target, "topic")
+        leaf.set("id", str(_next_id(root)))
+        leaf.set("text", new_placement.title)
+
+        if new_placement.url:
+            link = ET.SubElement(leaf, "link")
+            link.set("url", new_placement.url)
+            link.set("type", "url")
+
+        if new_placement.note:
+            note_el = ET.SubElement(leaf, "note")
+            note_el.set("text", new_placement.note)
+
+        _assign_positions(root)
+        await self._save_xml(ET.tostring(root, encoding="unicode", xml_declaration=False))
+
+        parts = list(new_placement.branch_path)
+        if new_placement.new_branch:
+            parts.append(new_placement.new_branch)
+        parts.append(new_placement.title)
+        return " > ".join(parts)
+
     async def login(self) -> None:
         resp = await self._client.post(
             f"{self._base}/api/restful/authenticate",
