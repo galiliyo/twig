@@ -11,7 +11,7 @@ Authentication: JWT Bearer token obtained at startup; re-fetched on 401.
 import os
 import xml.etree.ElementTree as ET
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -23,6 +23,7 @@ class Placement:
     title: str               # short leaf node title
     url: str | None = None   # original URL, attached as a clickable link
     note: str | None = None  # extracted article content, attached as a note
+    tags: list[str] = field(default_factory=list)  # AI-generated topic tags
 
 
 class WiseMappingError(Exception):

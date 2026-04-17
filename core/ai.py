@@ -25,13 +25,15 @@ Given a list of existing branch paths and a captured item, return a JSON object:
 {
   "branch_path": ["Parent", "Child"],   // existing path to place under
   "new_branch": null,                   // or a short label if a new intermediate branch is needed
-  "title": "Short leaf node title"      // ≤ 6 words
+  "title": "Short leaf node title",     // ≤ 6 words
+  "tags": ["tag1", "tag2"]             // 2–4 lowercase single-word tags describing the topic
 }
 
 Rules:
 - Prefer existing branches. Create new_branch only as a last resort.
 - Prefer broader categories over narrow ones.
 - title must be concise (≤ 6 words).
+- tags must be lowercase single words (no spaces or hyphens), 2–4 of them.
 - Respond with valid JSON only, no prose.
 """
 
@@ -75,6 +77,7 @@ async def choose_placement(branches: list[str], item: ExtractedInput) -> Placeme
         branch_path=data["branch_path"],
         new_branch=data.get("new_branch"),
         title=data["title"],
+        tags=data.get("tags", []),
     )
 
 
