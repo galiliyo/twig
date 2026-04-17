@@ -4,3 +4,5 @@
 __pycache__/
 *.pyc
 medium_cookies.json
+bash.exe.stackdump
+.worktrees/
