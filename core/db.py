@@ -180,7 +180,7 @@ async def search(
                 SELECT id, title, url, branch_path, tags, note,
                        similarity(title || ' ' || COALESCE(note, ''), $1) AS sim
                 FROM items
-                WHERE title || ' ' || COALESCE(note, '') % $1
+                WHERE (title || ' ' || COALESCE(note, '')) % $1
                 ORDER BY sim DESC
                 LIMIT 20
                 """,
