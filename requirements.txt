@@ -6,3 +6,7 @@ python-dotenv
 exa-py
 yt-dlp
 playwright==1.48.0
+asyncpg
+pgvector
+pytest
+pytest-asyncio
