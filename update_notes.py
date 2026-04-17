@@ -19,7 +19,8 @@ load_dotenv()
 
 from core.wisemapping import WiseMapping, _assign_positions
 from core.extractor import _fetch_with_playwright
-from core.ai import summarize_bullets
+from core.ai import summarize_bullets, embed_query
+from core.db import init_db, _pool
 
 
 # Notes containing any of these strings are treated as "needs refresh"
@@ -41,6 +42,7 @@ async def main() -> None:
     dry_run = "--dry-run" in sys.argv
     refresh_all = "--all" in sys.argv
 
+    await init_db()
     wm = WiseMapping()
     await wm.login()
 
@@ -90,6 +92,18 @@ async def main() -> None:
             if dry_run:
                 print("  [DRY-RUN] no changes saved")
             else:
+                # DB write first
+                embed_text = f"{title_attr}. {bullets[:800]}".strip()
+                embedding = await embed_query(embed_text)
+                async with _pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE items SET note = $1, embedding = $2
+                        WHERE url = $3
+                        """,
+                        bullets, embedding, url,
+                    )
+                # Mutate XML for WiseMapping batch save later
                 note_el = topic.find("note")
                 if note_el is None:
                     note_el = ET.SubElement(topic, "note")
