@@ -19,17 +19,29 @@ async def _init_conn(conn: asyncpg.Connection) -> None:
     )
 
 
+async def _create_extensions(dsn: str) -> None:
+    """Open a temporary connection to create required extensions before the
+    pool is initialised.  The vector extension must exist before any pooled
+    connection runs _init_conn(), otherwise register_vector() raises
+    ``ValueError: unknown type: public.vector``."""
+    conn = await asyncpg.connect(dsn, ssl=False)
+    try:
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+    finally:
+        await conn.close()
+
+
 async def init_db(dsn: str | None = None, pool: asyncpg.Pool | None = None) -> None:
     global _pool
     if pool is not None:
         _pool = pool
     else:
         dsn = dsn or os.environ["DATABASE_URL"]
-        _pool = await asyncpg.create_pool(dsn, init=_init_conn)
+        await _create_extensions(dsn)
+        _pool = await asyncpg.create_pool(dsn, ssl=False, init=_init_conn)
 
     async with _pool.acquire() as conn:
-        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS items (
                 id          SERIAL PRIMARY KEY,
@@ -168,7 +180,7 @@ async def search(
                 SELECT id, title, url, branch_path, tags, note,
                        similarity(title || ' ' || COALESCE(note, ''), $1) AS sim
                 FROM items
-                WHERE title || ' ' || COALESCE(note, '') % $1
+                WHERE (title || ' ' || COALESCE(note, '')) % $1
                 ORDER BY sim DESC
                 LIMIT 20
                 """,
