@@ -20,7 +20,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from core.extractor import extract
 from core.wisemapping import WiseMapping, WiseMappingError
-from core.ai import choose_placement, choose_relocation, summarize_bullets
+from core.ai import choose_placement, choose_relocation, summarize_bullets, embed_query
+from core.db import init_db, save_item, get_recent, get_last_saved, set_last_saved, update_item_path
 from core.search import search, build_index, invalidate_index
 
 logging.basicConfig(
@@ -31,23 +32,18 @@ log = logging.getLogger(__name__)
 
 ALLOWED_USER_ID = int(os.environ["TELEGRAM_ALLOWED_USER_ID"])
 
-# Duplicate guard: raw message texts in-flight or recently saved
-_recent: list[str] = []
-_RECENT_MAX = 50
+# Duplicate guard: texts currently being processed
 _in_flight: set[str] = set()
 
 # Maps bot warning message_id → original user text, so "force" replies work
 _force_pending: dict[int, str] = {}
-
-# Last saved item — used by /replace to know what to move
-_last_saved: dict | None = None  # {branch_path, title, url, note}
 
 # Maps bot /replace message_id → list of top-level branch names, so numbered reply works
 _replace_pending: dict[int, list[str]] = {}
 
 
 async def _save_item(text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Extract, place, and save a single item. Replies with result or error."""
+    """Extract, place, embed, save to DB, then sync to WiseMapping."""
     message = update.effective_message
     if message is None:
         return
@@ -59,7 +55,6 @@ async def _save_item(text: str, update: Update, context: ContextTypes.DEFAULT_TY
         placement = await choose_placement(branches, item)
 
         placement.url = item.url
-        # Try to summarize the raw content into bullets; fall back to truncated raw text on failure
         bullets = await summarize_bullets(item.summary, title=item.title) if item.summary else None
         if bullets:
             placement.note = bullets
@@ -70,36 +65,62 @@ async def _save_item(text: str, update: Update, context: ContextTypes.DEFAULT_TY
         else:
             placement.note = None
             log.info("placement.url=%r  note_len=0", placement.url)
-        saved_path = await wm.add_node(placement)
 
-        _recent.append(text)
-        if len(_recent) > _RECENT_MAX:
-            _recent.pop(0)
+        embed_text = (
+            f"{' > '.join(placement.branch_path)}: {placement.title}. "
+            f"{(placement.note or '')[:800]}"
+        ).strip()
+        embedding = await embed_query(embed_text)
 
-        # Track last saved item for /replace
-        global _last_saved
-        _last_saved = {
-            "branch_path": list(placement.branch_path) + ([placement.new_branch] if placement.new_branch else []),
+        full_branch_path = list(placement.branch_path) + (
+            [placement.new_branch] if placement.new_branch else []
+        )
+
+        # DB is the commit point
+        item_id = await save_item(
+            text_input=text,
+            title=placement.title,
+            url=placement.url,
+            branch_path=full_branch_path,
+            tags=placement.tags,
+            note=placement.note,
+            embedding=embedding,
+        )
+        await set_last_saved({
+            "id": item_id,
+            "branch_path": full_branch_path,
             "title": placement.title,
             "url": placement.url,
             "note": placement.note,
-        }
+        })
+
+        # Fire-and-forget WiseMapping sync
+        saved_path = " > ".join(full_branch_path + [placement.title])
+        try:
+            saved_path = await wm.add_node(placement)
+        except Exception as exc:
+            log.warning("WiseMapping sync failed (item saved to DB id=%s): %s", item_id, exc)
 
         invalidate_index()
 
-        note_preview = f"\n📝 {len(placement.note)}c: {placement.note[:80]}" if placement.note else "\n📝 (no note)"
-        log.info("Saved: %s", saved_path)
+        note_preview = (
+            f"\n📝 {len(placement.note)}c: {placement.note[:80]}"
+            if placement.note else "\n📝 (no note)"
+        )
+        log.info("Saved to DB (id=%s): %s", item_id, saved_path)
         await message.reply_text(f"✓ Saved to {saved_path}{note_preview}")
 
     except WiseMappingError as exc:
         log.error("WiseMapping error: %s", exc)
-        msg = "Could not authenticate with WiseMapping" if "auth" in str(exc).lower() else "Could not save map update"
+        msg = (
+            "Could not authenticate with WiseMapping"
+            if "auth" in str(exc).lower()
+            else "Could not save map update"
+        )
         await message.reply_text(f"❌ {msg}")
-
     except Exception as exc:
         log.exception("Unexpected error: %s", exc)
         await message.reply_text("❌ Something went wrong")
-
     finally:
         _in_flight.discard(text)
 
@@ -112,7 +133,8 @@ async def replace_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if message is None:
         return
 
-    if _last_saved is None:
+    last_saved = await get_last_saved()
+    if last_saved is None:
         await message.reply_text("No recently saved item to replace.")
         return
 
@@ -127,8 +149,13 @@ async def replace_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("No branches found in the map.")
         return
 
-    old_path = " > ".join(_last_saved["branch_path"] + [_last_saved["title"]])
-    lines = [f"Moving: {_last_saved['title']}", f"Currently at: {old_path}", "", "Pick a top-level branch:"]
+    old_path = " > ".join(last_saved["branch_path"] + [last_saved["title"]])
+    lines = [
+        f"Moving: {last_saved['title']}",
+        f"Currently at: {old_path}",
+        "",
+        "Pick a top-level branch:",
+    ]
     for i, branch in enumerate(top_branches, 1):
         lines.append(f"  {i}. {branch}")
     lines.append("\nReply with the number.")
@@ -144,12 +171,12 @@ async def _handle_replace_choice(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Relocate the last saved item under the chosen top-level branch."""
-    global _last_saved
     message = update.effective_message
     if message is None:
         return
 
-    if _last_saved is None:
+    last_saved = await get_last_saved()
+    if last_saved is None:
         await message.reply_text("No recently saved item to replace.")
         return
 
@@ -165,24 +192,35 @@ async def _handle_replace_choice(
         new_placement = await choose_relocation(
             top_level=chosen,
             sub_branches=sub_branches,
-            item_title=_last_saved["title"],
-            item_url=_last_saved["url"],
-            item_note=_last_saved["note"],
+            item_title=last_saved["title"],
+            item_url=last_saved.get("url"),
+            item_note=last_saved.get("note"),
         )
 
-        new_path = await wm.move_node(
-            old_path=_last_saved["branch_path"],
-            old_title=_last_saved["title"],
-            new_placement=new_placement,
+        new_branch_path = list(new_placement.branch_path) + (
+            [new_placement.new_branch] if new_placement.new_branch else []
         )
 
-        # Update last_saved to reflect new location
-        _last_saved = {
-            "branch_path": list(new_placement.branch_path) + ([new_placement.new_branch] if new_placement.new_branch else []),
+        # DB write first
+        await update_item_path(last_saved["id"], new_branch_path)
+        await set_last_saved({
+            "id": last_saved["id"],
+            "branch_path": new_branch_path,
             "title": new_placement.title,
-            "url": new_placement.url or _last_saved.get("url"),
-            "note": new_placement.note or _last_saved.get("note"),
-        }
+            "url": new_placement.url or last_saved.get("url"),
+            "note": new_placement.note or last_saved.get("note"),
+        })
+
+        # Fire-and-forget WiseMapping sync
+        new_path = " > ".join(new_branch_path + [new_placement.title])
+        try:
+            new_path = await wm.move_node(
+                old_path=last_saved["branch_path"],
+                old_title=last_saved["title"],
+                new_placement=new_placement,
+            )
+        except Exception as exc:
+            log.warning("WiseMapping move sync failed (DB updated): %s", exc)
 
         invalidate_index()
         log.info("Relocated to: %s", new_path)
@@ -228,7 +266,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     log.info("Received message: %r", text[:120])
 
     # Early duplicate check — catches repeated sends before expensive Exa/AI calls
-    if text in _in_flight or text in _recent:
+    recent = await get_recent(50)
+    if text in _in_flight or text in recent:
         warning = await message.reply_text("↺ Already processing or recently saved — reply force to save anyway")
         _force_pending[warning.message_id] = text
         return
@@ -472,8 +511,9 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def post_init(app) -> None:
+    await init_db()
     await app.bot_data["wm"].login()
-    log.info("WiseMapping session established")
+    log.info("DB and WiseMapping session established")
 
 
 async def post_shutdown(app) -> None:
