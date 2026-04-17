@@ -25,7 +25,7 @@ async def init_db(dsn: str | None = None, pool: asyncpg.Pool | None = None) -> N
         _pool = pool
     else:
         dsn = dsn or os.environ["DATABASE_URL"]
-        _pool = await asyncpg.create_pool(dsn, init=_init_conn)
+        _pool = await asyncpg.create_pool(dsn, ssl=False, init=_init_conn)
 
     async with _pool.acquire() as conn:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
