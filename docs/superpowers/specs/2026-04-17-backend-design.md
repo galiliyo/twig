@@ -147,8 +147,8 @@ Uses `asyncpg` directly (no ORM). Connection pool initialized in `init_db()`, st
 This local maintenance script backfills notes on nodes whose content was blocked/empty at save time. With DB as source of truth it must also update the DB when it writes a refreshed note back to WiseMapping.
 
 Changes needed:
-- After writing a refreshed note to WiseMapping, also `UPDATE items SET note = $1, embedding = $2 WHERE url = $3` (match by URL)
-- Re-embed the updated note text at the same time so search stays current
+- **DB write first**: `UPDATE items SET note = $1, embedding = $2 WHERE url = $3` — this is the commit point
+- **WiseMapping sync after**: push the updated note to WiseMapping as fire-and-forget (same pattern as the bot write path)
 - Requires `DATABASE_URL` in the local `.env` to connect from the dev machine
 
 ## Out of Scope
