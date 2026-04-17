@@ -36,6 +36,8 @@ Copy `.env.example` to `.env` and fill in:
 | `OPENROUTER_API_KEY` | OpenRouter API key |
 | `OPENROUTER_MODEL` | e.g. `openai/gpt-4o-mini` |
 | `EXA_API_KEY` | Exa API key (optional, improves content extraction) |
+| `OPENAI_API_KEY` | OpenAI API key — used for `/search` embeddings (`text-embedding-3-small`) |
+| `SEARCH_INDEX_PATH` | Override default index file path (optional, default: `search_index.json`) |
 
 ### 3. Run
 
@@ -52,17 +54,41 @@ The repo includes `railway.toml`. Push to a Railway project — it will run `pyt
 | Command | Description |
 |---|---|
 | `/debug` | List all branches currently in the map |
+| `/replace` | Relocate the last saved item to a different branch |
 | `/testnote <url>` | Test content extraction for a URL without saving |
 | `/showxml` | Show raw XML of the last 2 nodes in the map |
+
+## Enriching notes (`update_notes.py`)
+
+A local maintenance script that backfills or refreshes notes on nodes whose content was blocked or empty when originally saved (e.g. Cloudflare-challenged pages).
+
+Run it from your machine — it uses your local IP and `medium_cookies.json` to fetch full article content, summarizes via OpenRouter, and writes the result back to WiseMapping.
+
+```bash
+python update_notes.py            # refresh blocked/empty notes only
+python update_notes.py --dry-run  # preview what would change, no saves
+python update_notes.py --all      # refresh every node that has a URL
+```
+
+**What it does per node:**
+
+1. Walks all topics in the map XML and collects those with a URL link
+2. Flags notes that contain bot-challenge markers (e.g. "Just a moment", "Attention Required") or are empty
+3. Fetches the full page via Playwright (same stealth approach as the bot)
+4. Summarizes with `summarize_bullets` and writes the result back as a `<note text="…"/>` attribute
+5. Saves the updated XML to WiseMapping in one batch at the end
+
+Requires `medium_cookies.json` in the project root for paywalled sites.
 
 ## Project structure
 
 ```
-bot.py              — Telegram handler, duplicate guard, force-save
+bot.py              — Telegram handler, duplicate guard, force-save, /replace
+update_notes.py     — Local script to backfill/refresh blocked or empty notes
 core/
-  extractor.py      — Input detection, HTTP fetch, Exa fallback
-  wisemapping.py    — WiseMapping REST API, XML read/write
-  ai.py             — OpenRouter branch placement
+  extractor.py      — Input detection, HTTP fetch, yt-dlp for YouTube, Exa fallback
+  wisemapping.py    — WiseMapping REST API, XML read/write, node move
+  ai.py             — OpenRouter: placement, relocation, summarization
 ```
 
 ## Notes
@@ -71,3 +97,4 @@ core/
 - Duplicate messages are detected before any expensive API calls; reply `force` to a duplicate warning to save anyway
 - WiseMapping notes appear as a small icon on each node — click to expand
 - Exa content for paywalled articles (Medium etc.) is limited to the public preview
+- `/replace` state (`_last_saved`) is in-memory and lost on bot restart

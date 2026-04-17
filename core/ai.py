@@ -213,6 +213,35 @@ async def summarize_bullets(text: str, title: str | None = None) -> str | None:
         return None
 
 
+_OPENAI_EMBED_URL = "https://api.openai.com/v1/embeddings"
+_EMBED_MODEL = "text-embedding-3-small"
+_EMBED_CHUNK = 100  # max texts per batch request
+
+
+async def embed_texts(texts: list[str]) -> list[list[float]]:
+    """Batch-embed a list of strings. Splits into chunks to stay under API limits."""
+    results: list[list[float]] = []
+    async with httpx.AsyncClient(timeout=60) as client:
+        for i in range(0, len(texts), _EMBED_CHUNK):
+            batch = texts[i : i + _EMBED_CHUNK]
+            resp = await client.post(
+                _OPENAI_EMBED_URL,
+                json={"model": _EMBED_MODEL, "input": batch},
+                headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"Embedding API error: HTTP {resp.status_code} — {resp.text}")
+            data = sorted(resp.json()["data"], key=lambda x: x["index"])
+            results.extend(item["embedding"] for item in data)
+    return results
+
+
+async def embed_query(text: str) -> list[float]:
+    """Embed a single query string."""
+    results = await embed_texts([text])
+    return results[0]
+
+
 def _describe(item: ExtractedInput) -> str:
     parts = [f"type={item.type.value}"]
     if item.title:

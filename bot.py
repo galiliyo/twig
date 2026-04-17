@@ -21,6 +21,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from core.extractor import extract
 from core.wisemapping import WiseMapping, WiseMappingError
 from core.ai import choose_placement, choose_relocation, summarize_bullets
+from core.search import search, build_index, invalidate_index
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,6 +84,8 @@ async def _save_item(text: str, update: Update, context: ContextTypes.DEFAULT_TY
             "url": placement.url,
             "note": placement.note,
         }
+
+        invalidate_index()
 
         note_preview = f"\n📝 {len(placement.note)}c: {placement.note[:80]}" if placement.note else "\n📝 (no note)"
         log.info("Saved: %s", saved_path)
@@ -181,6 +184,7 @@ async def _handle_replace_choice(
             "note": new_placement.note or _last_saved.get("note"),
         }
 
+        invalidate_index()
         log.info("Relocated to: %s", new_path)
         await message.reply_text(f"✓ Moved to {new_path}")
 
@@ -230,6 +234,60 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     await _save_item(text, update, context)
+
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Semantic search over mind-map notes and titles."""
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+    message = update.effective_message
+    if message is None:
+        return
+
+    query = " ".join(context.args or []).strip()
+    if not query:
+        await message.reply_text("Usage: /search <what you're looking for>")
+        return
+
+    thinking = await message.reply_text("Searching…")
+    wm: WiseMapping = context.bot_data["wm"]
+    try:
+        results = await search(query, wm, top_k=5)
+    except Exception as exc:
+        log.exception("Search failed: %s", exc)
+        await thinking.edit_text(f"❌ Search failed: {exc}")
+        return
+
+    if not results:
+        await thinking.edit_text("No matching nodes found.")
+        return
+
+    lines = [f"Results for: {query!r}\n"]
+    for i, r in enumerate(results, 1):
+        note = r.get("note_snippet", "")
+        note_line = f"\n   {note[:120]}" if note else ""
+        url_line = f"\n   {r['url']}" if r.get("url") else ""
+        lines.append(f"{i}. {r['title']}\n   📍 {r['path']}{url_line}{note_line}")
+
+    await thinking.edit_text("\n\n".join(lines)[:4000])
+
+
+async def reindex_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Force-rebuild the semantic search index."""
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+    message = update.effective_message
+    if message is None:
+        return
+
+    thinking = await message.reply_text("Rebuilding search index…")
+    wm: WiseMapping = context.bot_data["wm"]
+    try:
+        entries = await build_index(wm)
+        await thinking.edit_text(f"✓ Index rebuilt: {len(entries)} nodes embedded.")
+    except Exception as exc:
+        log.exception("Reindex failed: %s", exc)
+        await thinking.edit_text(f"❌ Reindex failed: {exc}")
 
 
 async def testnote_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -436,6 +494,8 @@ def main() -> None:
     app.bot_data["wm"] = wm
 
     app.add_handler(CommandHandler("replace", replace_command))
+    app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("reindex", reindex_command))
     app.add_handler(CommandHandler("debug", debug_command))
     app.add_handler(CommandHandler("testnote", testnote_command))
     app.add_handler(CommandHandler("testmedium", testmedium_command))
