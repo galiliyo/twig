@@ -142,6 +142,15 @@ Uses `asyncpg` directly (no ORM). Connection pool initialized in `init_db()`, st
 2. `pgvector` must be enabled — Railway's Postgres supports it: `CREATE EXTENSION IF NOT EXISTS vector`
 3. No schema migrations needed beyond `init_db()` running on startup
 
+## `update_notes.py` Integration
+
+This local maintenance script backfills notes on nodes whose content was blocked/empty at save time. With DB as source of truth it must also update the DB when it writes a refreshed note back to WiseMapping.
+
+Changes needed:
+- After writing a refreshed note to WiseMapping, also `UPDATE items SET note = $1, embedding = $2 WHERE url = $3` (match by URL)
+- Re-embed the updated note text at the same time so search stays current
+- Requires `DATABASE_URL` in the local `.env` to connect from the dev machine
+
 ## Out of Scope
 
 - REST API / web dashboard
