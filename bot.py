@@ -21,7 +21,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from core.extractor import extract
 from core.wisemapping import WiseMapping, WiseMappingError
 from core.ai import choose_placement, choose_relocation, summarize_bullets, embed_query
-from core.db import init_db, save_item, get_recent, get_last_saved, set_last_saved, update_item_path
+from core.db import init_db, save_item, get_recent, get_last_saved, set_last_saved, update_item_path, add_category, get_branches, get_category_paths, delete_category, count_items_under
 from core.search import search, build_index, invalidate_index
 
 logging.basicConfig(
@@ -51,7 +51,7 @@ async def _save_item(text: str, update: Update, context: ContextTypes.DEFAULT_TY
     wm: WiseMapping = context.bot_data["wm"]
     try:
         item = await extract(text)
-        branches = await wm.get_branches()
+        branches = await get_branches()
         placement = await choose_placement(branches, item)
 
         placement.url = item.url
@@ -329,6 +329,96 @@ async def reindex_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await thinking.edit_text(f"❌ Reindex failed: {exc}")
 
 
+async def addcategory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Create a new category. Usage: /addcategory Parent > Child > SubChild"""
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+    message = update.effective_message
+    if message is None:
+        return
+
+    raw = " ".join(context.args or []).strip()
+    if not raw:
+        await message.reply_text("Usage: /addcategory Parent > Child > SubChild")
+        return
+
+    path = [p.strip() for p in raw.split(">") if p.strip()]
+    if not path:
+        await message.reply_text("Usage: /addcategory Parent > Child > SubChild")
+        return
+
+    wm: WiseMapping = context.bot_data["wm"]
+    await add_category(path)
+
+    # Mirror to WiseMapping
+    try:
+        xml_text = await wm._fetch_xml()
+        import xml.etree.ElementTree as ET
+        from core.wisemapping import _find_or_create_path, _assign_positions
+        root = ET.fromstring(xml_text)
+        _find_or_create_path(root, path)
+        _assign_positions(root)
+        await wm._save_xml(ET.tostring(root, encoding="unicode", xml_declaration=False))
+    except Exception as exc:
+        log.warning("WiseMapping category sync failed: %s", exc)
+
+    await message.reply_text(f"✓ Category created: {' > '.join(path)}")
+
+
+async def synctree_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sync DB categories from the current WiseMapping tree structure."""
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+    message = update.effective_message
+    if message is None:
+        return
+
+    thinking = await message.reply_text("Reading WiseMapping tree…")
+    wm: WiseMapping = context.bot_data["wm"]
+
+    from core.wisemapping import _find_or_create_path, _assign_positions
+    import xml.etree.ElementTree as ET
+    from migrate_wisemapping_to_db import _extract_tree
+
+    xml_text = await wm._fetch_xml()
+    wm_categories, _ = _extract_tree(xml_text)
+    wm_set = {tuple(p) for p in wm_categories}
+
+    db_categories = await get_category_paths()
+    db_set = {tuple(p) for p in db_categories}
+
+    to_add = [list(p) for p in sorted(wm_set - db_set)]
+    to_remove = [list(p) for p in sorted(db_set - wm_set)]
+
+    # Split removals into safe (no items) and blocked (has items underneath)
+    safe_remove, blocked_remove = [], []
+    for path in to_remove:
+        n = await count_items_under(path)
+        (blocked_remove if n else safe_remove).append((path, n))
+
+    # Apply safe changes
+    for path in to_add:
+        await add_category(path)
+    for path, _ in safe_remove:
+        await delete_category(path)
+
+    lines = []
+    if to_add:
+        lines.append(f"✓ Added {len(to_add)} categories:")
+        lines.extend(f"  + {' > '.join(p)}" for p in to_add)
+    if safe_remove:
+        lines.append(f"✓ Removed {len(safe_remove)} empty categories:")
+        lines.extend(f"  - {' > '.join(p)}" for p, _ in safe_remove)
+    if blocked_remove:
+        lines.append(f"⚠️ {len(blocked_remove)} categories removed from map but skipped (have items):")
+        lines.extend(f"  ! {' > '.join(p)}  ({n} items)" for p, n in blocked_remove)
+        lines.append("  Reassign those items before removing the categories.")
+    if not to_add and not safe_remove and not blocked_remove:
+        lines.append("✓ DB already matches WiseMapping tree — nothing to do.")
+
+    await thinking.edit_text("\n".join(lines))
+
+
 async def testnote_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ALLOWED_USER_ID:
         return
@@ -498,9 +588,9 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     wm: WiseMapping = context.bot_data["wm"]
     try:
-        branches = await wm.get_branches()
+        branches = await get_branches()
         if not branches:
-            await message.reply_text("⚠️ No branches found (empty map or parse error)")
+            await message.reply_text("⚠️ No categories found in DB")
             return
         lines = "\n".join(f"• {b}" for b in branches)
         if len(lines) > 4000:
@@ -533,6 +623,8 @@ def main() -> None:
     wm = WiseMapping()
     app.bot_data["wm"] = wm
 
+    app.add_handler(CommandHandler("addcategory", addcategory_command))
+    app.add_handler(CommandHandler("synctree", synctree_command))
     app.add_handler(CommandHandler("replace", replace_command))
     app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("reindex", reindex_command))

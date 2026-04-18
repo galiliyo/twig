@@ -56,6 +56,13 @@ async def init_db(dsn: str | None = None, pool: asyncpg.Pool | None = None) -> N
             )
         """)
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS categories (
+                id         SERIAL PRIMARY KEY,
+                path       TEXT[]      NOT NULL,
+                UNIQUE (path)
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS bot_state (
                 key        TEXT PRIMARY KEY,
                 value      JSONB       NOT NULL,
@@ -97,6 +104,44 @@ async def save_item(
             text_input, title, url, branch_path, tags, note, embedding,
         )
     return row["id"]
+
+
+async def add_category(path: list[str]) -> None:
+    """Insert a category path (e.g. ['Tech', 'AI']). No-op if it already exists."""
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO categories (path) VALUES ($1) ON CONFLICT DO NOTHING",
+            path,
+        )
+
+
+async def get_branches() -> list[str]:
+    """Return all category paths as 'Parent > Child' strings, sorted."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT path FROM categories ORDER BY path")
+    return [" > ".join(list(r["path"])) for r in rows]
+
+
+async def get_category_paths() -> list[list[str]]:
+    """Return all category paths as raw arrays."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT path FROM categories ORDER BY path")
+    return [list(r["path"]) for r in rows]
+
+
+async def delete_category(path: list[str]) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute("DELETE FROM categories WHERE path = $1", path)
+
+
+async def count_items_under(path: list[str]) -> int:
+    """Count items whose branch_path starts with the given path."""
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) FROM items WHERE branch_path[$1:$2] = $3",
+            1, len(path), path,
+        )
+    return row[0]
 
 
 async def get_recent(n: int = 50) -> list[str]:
@@ -168,6 +213,7 @@ async def search(
                        embedding <=> $1 AS dist
                 FROM items
                 WHERE embedding IS NOT NULL
+                  AND embedding <=> $1 < 0.65
                 ORDER BY dist
                 LIMIT 20
                 """,
