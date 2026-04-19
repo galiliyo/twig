@@ -213,7 +213,7 @@ async def search(
                        embedding <=> $1 AS dist
                 FROM items
                 WHERE embedding IS NOT NULL
-                  AND embedding <=> $1 < 0.65
+                  AND embedding <=> $1 < 0.75
                 ORDER BY dist
                 LIMIT 20
                 """,
@@ -224,9 +224,9 @@ async def search(
             dict(r) for r in await conn.fetch(
                 """
                 SELECT id, title, url, branch_path, tags, note,
-                       similarity(title || ' ' || COALESCE(note, ''), $1) AS sim
+                       word_similarity($1, title || ' ' || COALESCE(note, '') || ' ' || array_to_string(tags, ' ')) AS sim
                 FROM items
-                WHERE (title || ' ' || COALESCE(note, '')) % $1
+                WHERE $1 <% (title || ' ' || COALESCE(note, '') || ' ' || array_to_string(tags, ' '))
                 ORDER BY sim DESC
                 LIMIT 20
                 """,
