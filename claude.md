@@ -33,3 +33,6 @@ core/search.py      RRF merge of semantic + fuzzy search results
 - **YouTube extraction**: yt-dlp extracts title + description (channel info included); falls back to `_fetch_page` on failure
 - **/replace flow**: reply-based — bot shows numbered top-level branches, user replies with number, bot AI picks 2nd-level leaf and moves the node
 - **`_last_saved` state**: persisted to `bot_state` table in Postgres — survives restarts
+- **Search threshold**: semantic cosine distance cutoff is 0.92 (`db.py`) — was 0.75 but that was too strict for conceptually-related queries on a small dataset; tighten if the DB grows large and results get noisy
+- **`_pool` import trap**: `core/search.py` imports `core.db` as a module (`import core.db as _db`) — NOT `from core.db import _pool`. The `from ... import` form captures `None` at load time before `init_db()` runs
+- **`/searchdebug <query>`**: debug command that shows raw semantic/fuzzy/LIKE hit counts and top distances — use to diagnose why a result is missing

@@ -219,7 +219,7 @@ async def search_debug(
                 query_embedding,
             )
         ]
-        sem_threshold_rows = [r for r in sem_rows if r["dist"] < 0.75]
+        sem_threshold_rows = [r for r in sem_rows if r["dist"] < 0.92]
         fuzz_rows = [
             dict(r) for r in await conn.fetch(
                 """
@@ -274,7 +274,7 @@ async def search(
                        embedding <=> $1 AS dist
                 FROM items
                 WHERE embedding IS NOT NULL
-                  AND embedding <=> $1 < 0.75
+                  AND embedding <=> $1 < 0.92
                 ORDER BY dist
                 LIMIT 20
                 """,
