@@ -25,7 +25,7 @@ from core.db import init_db, save_item, get_recent, get_last_saved, set_last_sav
 from core.search import search, build_index, invalidate_index
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)

@@ -205,6 +205,7 @@ async def search(
     query_embedding: list[float],
     top_k: int = 5,
 ) -> list[dict]:
+    like_pattern = f"%{query_text}%"
     async with _pool.acquire() as conn:
         sem_rows = [
             dict(r) for r in await conn.fetch(
@@ -233,7 +234,24 @@ async def search(
                 query_text,
             )
         ]
-    results = _rrf_merge(sem_rows, fuzz_rows, top_k=top_k)
+        like_rows = [
+            dict(r) for r in await conn.fetch(
+                """
+                SELECT id, title, url, branch_path, tags, note, 0.5 AS sim
+                FROM items
+                WHERE title ILIKE $1
+                   OR COALESCE(note, '') ILIKE $1
+                   OR array_to_string(tags, ' ') ILIKE $1
+                LIMIT 20
+                """,
+                like_pattern,
+            )
+        ]
+    _log.debug(
+        "search %r: sem=%d fuzz=%d like=%d",
+        query_text, len(sem_rows), len(fuzz_rows), len(like_rows),
+    )
+    results = _rrf_merge(sem_rows, fuzz_rows + like_rows, top_k=top_k)
     return [
         {
             "id": r["id"],
