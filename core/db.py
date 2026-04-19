@@ -200,6 +200,66 @@ def _rrf_merge(
     return [rows_by_id[rid] | {"score": score} for rid, score in ranked]
 
 
+async def search_debug(
+    query_text: str,
+    query_embedding: list[float],
+) -> dict:
+    """Return raw counts and top hits from each search leg for debugging."""
+    like_pattern = f"%{query_text}%"
+    async with _pool.acquire() as conn:
+        sem_rows = [
+            dict(r) for r in await conn.fetch(
+                """
+                SELECT id, title, embedding <=> $1 AS dist
+                FROM items
+                WHERE embedding IS NOT NULL
+                ORDER BY dist
+                LIMIT 5
+                """,
+                query_embedding,
+            )
+        ]
+        sem_threshold_rows = [r for r in sem_rows if r["dist"] < 0.75]
+        fuzz_rows = [
+            dict(r) for r in await conn.fetch(
+                """
+                SELECT id, title,
+                       word_similarity($1, title || ' ' || COALESCE(note, '') || ' ' || array_to_string(tags, ' ')) AS sim
+                FROM items
+                WHERE $1 <% (title || ' ' || COALESCE(note, '') || ' ' || array_to_string(tags, ' '))
+                ORDER BY sim DESC
+                LIMIT 5
+                """,
+                query_text,
+            )
+        ]
+        like_rows = [
+            dict(r) for r in await conn.fetch(
+                """
+                SELECT id, title
+                FROM items
+                WHERE title ILIKE $1
+                   OR COALESCE(note, '') ILIKE $1
+                   OR array_to_string(tags, ' ') ILIKE $1
+                LIMIT 5
+                """,
+                like_pattern,
+            )
+        ]
+        total = await conn.fetchval("SELECT COUNT(*) FROM items")
+        no_emb = await conn.fetchval("SELECT COUNT(*) FROM items WHERE embedding IS NULL")
+    return {
+        "total_items": total,
+        "no_embedding": no_emb,
+        "sem_top5": [{"title": r["title"], "dist": round(r["dist"], 3)} for r in sem_rows],
+        "sem_hits": len(sem_threshold_rows),
+        "fuzz_hits": len(fuzz_rows),
+        "fuzz_top": [{"title": r["title"], "sim": round(r["sim"], 3)} for r in fuzz_rows],
+        "like_hits": len(like_rows),
+        "like_top": [r["title"] for r in like_rows],
+    }
+
+
 async def search(
     query_text: str,
     query_embedding: list[float],

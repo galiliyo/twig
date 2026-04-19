@@ -21,7 +21,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from core.extractor import extract
 from core.wisemapping import WiseMapping, WiseMappingError
 from core.ai import choose_placement, choose_relocation, summarize_bullets, embed_query
-from core.db import init_db, save_item, get_recent, get_last_saved, set_last_saved, update_item_path, add_category, get_branches, get_category_paths, delete_category, count_items_under
+from core.db import init_db, save_item, get_recent, get_last_saved, set_last_saved, update_item_path, add_category, get_branches, get_category_paths, delete_category, count_items_under, search_debug
 from core.search import search, build_index, invalidate_index
 
 logging.basicConfig(
@@ -309,6 +309,52 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         lines.append(f"{i}. {r['title']}\n   📍 {r['path']}{url_line}{note_line}")
 
     await thinking.edit_text("\n\n".join(lines)[:4000])
+
+
+async def searchdebug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+    message = update.effective_message
+    if message is None:
+        return
+
+    query = " ".join(context.args or []).strip()
+    if not query:
+        await message.reply_text("Usage: /searchdebug <query>")
+        return
+
+    thinking = await message.reply_text("Debugging…")
+    from core.ai import embed_query
+    try:
+        q_emb = await embed_query(query)
+        info = await search_debug(query, q_emb)
+    except Exception as exc:
+        await thinking.edit_text(f"❌ Error: {exc}")
+        return
+
+    lines = [
+        f"Query: {query!r}",
+        f"DB: {info['total_items']} items, {info['no_embedding']} missing embeddings",
+        "",
+        f"Semantic hits (dist<0.75): {info['sem_hits']}",
+        "Top 5 by distance:",
+    ]
+    for r in info["sem_top5"]:
+        lines.append(f"  {r['dist']} — {r['title']}")
+    lines += [
+        "",
+        f"Fuzzy (word_similarity) hits: {info['fuzz_hits']}",
+    ]
+    for r in info["fuzz_top"]:
+        lines.append(f"  {r['sim']} — {r['title']}")
+    lines += [
+        "",
+        f"ILIKE hits: {info['like_hits']}",
+    ]
+    for t in info["like_top"]:
+        lines.append(f"  {t}")
+
+    await thinking.edit_text("\n".join(lines)[:4000])
 
 
 async def reindex_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -676,6 +722,7 @@ def main() -> None:
     app.add_handler(CommandHandler("synctree", synctree_command))
     app.add_handler(CommandHandler("replace", replace_command))
     app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("searchdebug", searchdebug_command))
     app.add_handler(CommandHandler("reindex", reindex_command))
     app.add_handler(CommandHandler("debug", debug_command))
     app.add_handler(CommandHandler("testnote", testnote_command))
