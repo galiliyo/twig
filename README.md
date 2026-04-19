@@ -1,17 +1,16 @@
 # Twig
 
-A personal Telegram bot that captures links, ideas, and reminders directly into a WiseMapping mind map using AI for placement.
+A personal Telegram bot that captures links, ideas, and reminders into a Postgres database and a WiseMapping mind map, using AI for placement and semantic search for retrieval.
 
 ## What it does
 
 Send any message to the bot and it:
 
 1. Detects the input type (URL, YouTube link, idea, reminder)
-2. Fetches article metadata via direct HTTP or Exa (for Cloudflare-blocked sites)
-3. Reads your WiseMapping mind map
-4. Uses an AI model (via OpenRouter) to choose the best branch
-5. Saves the item as a new node — with the original URL as a link and article text as a note
-6. Replies with the saved path: `✓ Saved to Front-End > Angular`
+2. Fetches article metadata via direct HTTP, Playwright (paywalled sites), yt-dlp (YouTube), or Exa fallback
+3. Uses AI to choose the best branch from your category tree
+4. Saves the item to Postgres (with a vector embedding) and mirrors it to WiseMapping
+5. Replies with the saved path: `Saved to AI & ML > Claude`
 
 ## Setup
 
@@ -21,7 +20,14 @@ Send any message to the bot and it:
 pip install -r requirements.txt
 ```
 
-### 2. Configure environment
+### 2. Create databases
+
+```bash
+createdb twig
+createdb twig_test   # for tests only
+```
+
+### 3. Configure environment
 
 Copy `.env.example` to `.env` and fill in:
 
@@ -36,10 +42,18 @@ Copy `.env.example` to `.env` and fill in:
 | `OPENROUTER_API_KEY` | OpenRouter API key |
 | `OPENROUTER_MODEL` | e.g. `openai/gpt-4o-mini` |
 | `EXA_API_KEY` | Exa API key (optional, improves content extraction) |
-| `OPENAI_API_KEY` | OpenAI API key — used for `/search` embeddings (`text-embedding-3-small`) |
-| `SEARCH_INDEX_PATH` | Override default index file path (optional, default: `search_index.json`) |
+| `OPENAI_API_KEY` | OpenAI API key — used for embeddings (`text-embedding-3-small`) |
+| `DATABASE_URL` | Postgres connection string for production |
+| `TEST_DATABASE_URL` | Postgres connection string for tests |
 
-### 3. Run
+### 4. Migrate existing WiseMapping data (first run only)
+
+```bash
+python migrate_wisemapping_to_db.py           # import all nodes from WiseMapping
+python migrate_wisemapping_to_db.py --dry-run # preview without writing
+```
+
+### 5. Run
 
 ```bash
 python bot.py
@@ -53,16 +67,19 @@ The repo includes `railway.toml`. Push to a Railway project — it will run `pyt
 
 | Command | Description |
 |---|---|
-| `/debug` | List all branches currently in the map |
+| `/search <query>` | Semantic + fuzzy search across saved items |
 | `/replace` | Relocate the last saved item to a different branch |
+| `/addcategory Parent > Child` | Add a new category to the tree |
+| `/synctree` | Re-sync the category tree from WiseMapping into Postgres |
+| `/reindex` | Regenerate embeddings for all items |
+| `/debug` | List all branches currently in the category tree |
 | `/testnote <url>` | Test content extraction for a URL without saving |
+| `/testmedium <url>` | Test Medium/paywalled extraction via Playwright |
 | `/showxml` | Show raw XML of the last 2 nodes in the map |
 
 ## Enriching notes (`update_notes.py`)
 
-A local maintenance script that backfills or refreshes notes on nodes whose content was blocked or empty when originally saved (e.g. Cloudflare-challenged pages).
-
-Run it from your machine — it uses your local IP and `medium_cookies.json` to fetch full article content, summarizes via OpenRouter, and writes the result back to WiseMapping.
+A local maintenance script that backfills or refreshes notes on nodes whose content was blocked or empty when originally saved.
 
 ```bash
 python update_notes.py            # refresh blocked/empty notes only
@@ -70,31 +87,32 @@ python update_notes.py --dry-run  # preview what would change, no saves
 python update_notes.py --all      # refresh every node that has a URL
 ```
 
-**What it does per node:**
-
-1. Walks all topics in the map XML and collects those with a URL link
-2. Flags notes that contain bot-challenge markers (e.g. "Just a moment", "Attention Required") or are empty
-3. Fetches the full page via Playwright (same stealth approach as the bot)
-4. Summarizes with `summarize_bullets` and writes the result back as a `<note text="…"/>` attribute
-5. Saves the updated XML to WiseMapping in one batch at the end
-
 Requires `medium_cookies.json` in the project root for paywalled sites.
+
+## Tests
+
+```bash
+pytest
+```
 
 ## Project structure
 
 ```
-bot.py              — Telegram handler, duplicate guard, force-save, /replace
-update_notes.py     — Local script to backfill/refresh blocked or empty notes
+bot.py                        Telegram handler, duplicate guard, force-save, /replace
+migrate_wisemapping_to_db.py  One-shot import of WiseMapping nodes into Postgres
+update_notes.py               Backfill/refresh blocked or empty notes on existing nodes
 core/
-  extractor.py      — Input detection, HTTP fetch, yt-dlp for YouTube, Exa fallback
-  wisemapping.py    — WiseMapping REST API, XML read/write, node move
-  ai.py             — OpenRouter: placement, relocation, summarization
+  db.py           Postgres schema, pool, save/search/state helpers
+  extractor.py    Input detection, HTTP fetch, yt-dlp, Playwright, Exa fallback
+  wisemapping.py  WiseMapping REST API, XML read/write, node move
+  ai.py           OpenRouter: placement, relocation, summarization, embeddings
+  search.py       RRF merge of semantic + fuzzy search results
 ```
 
 ## Notes
 
 - Only one bot instance can run at a time (socket lock on port 47832)
-- Duplicate messages are detected before any expensive API calls; reply `force` to a duplicate warning to save anyway
+- Duplicate messages are detected before any expensive API calls; reply `force` to bypass
 - WiseMapping notes appear as a small icon on each node — click to expand
-- Exa content for paywalled articles (Medium etc.) is limited to the public preview
-- `/replace` state (`_last_saved`) is in-memory and lost on bot restart
+- `/replace` state is persisted to Postgres (`bot_state` table) and survives restarts
+- Passwords containing special characters (e.g. `@`) must be percent-encoded in connection URLs

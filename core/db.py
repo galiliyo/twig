@@ -56,6 +56,13 @@ async def init_db(dsn: str | None = None, pool: asyncpg.Pool | None = None) -> N
             )
         """)
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS categories (
+                id         SERIAL PRIMARY KEY,
+                path       TEXT[]      NOT NULL,
+                UNIQUE (path)
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS bot_state (
                 key        TEXT PRIMARY KEY,
                 value      JSONB       NOT NULL,
@@ -97,6 +104,44 @@ async def save_item(
             text_input, title, url, branch_path, tags, note, embedding,
         )
     return row["id"]
+
+
+async def add_category(path: list[str]) -> None:
+    """Insert a category path (e.g. ['Tech', 'AI']). No-op if it already exists."""
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO categories (path) VALUES ($1) ON CONFLICT DO NOTHING",
+            path,
+        )
+
+
+async def get_branches() -> list[str]:
+    """Return all category paths as 'Parent > Child' strings, sorted."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT path FROM categories ORDER BY path")
+    return [" > ".join(list(r["path"])) for r in rows]
+
+
+async def get_category_paths() -> list[list[str]]:
+    """Return all category paths as raw arrays."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT path FROM categories ORDER BY path")
+    return [list(r["path"]) for r in rows]
+
+
+async def delete_category(path: list[str]) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute("DELETE FROM categories WHERE path = $1", path)
+
+
+async def count_items_under(path: list[str]) -> int:
+    """Count items whose branch_path starts with the given path."""
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) FROM items WHERE branch_path[$1:$2] = $3",
+            1, len(path), path,
+        )
+    return row[0]
 
 
 async def get_recent(n: int = 50) -> list[str]:
@@ -155,11 +200,72 @@ def _rrf_merge(
     return [rows_by_id[rid] | {"score": score} for rid, score in ranked]
 
 
+async def search_debug(
+    query_text: str,
+    query_embedding: list[float],
+) -> dict:
+    """Return raw counts and top hits from each search leg for debugging."""
+    like_pattern = f"%{query_text}%"
+    async with _pool.acquire() as conn:
+        sem_rows = [
+            dict(r) for r in await conn.fetch(
+                """
+                SELECT id, title, embedding <=> $1 AS dist
+                FROM items
+                WHERE embedding IS NOT NULL
+                ORDER BY dist
+                LIMIT 5
+                """,
+                query_embedding,
+            )
+        ]
+        sem_threshold_rows = [r for r in sem_rows if r["dist"] < 0.92]
+        fuzz_rows = [
+            dict(r) for r in await conn.fetch(
+                """
+                SELECT id, title,
+                       word_similarity($1, title || ' ' || COALESCE(note, '') || ' ' || array_to_string(tags, ' ')) AS sim
+                FROM items
+                WHERE $1 <% (title || ' ' || COALESCE(note, '') || ' ' || array_to_string(tags, ' '))
+                ORDER BY sim DESC
+                LIMIT 5
+                """,
+                query_text,
+            )
+        ]
+        like_rows = [
+            dict(r) for r in await conn.fetch(
+                """
+                SELECT id, title
+                FROM items
+                WHERE title ILIKE $1
+                   OR COALESCE(note, '') ILIKE $1
+                   OR array_to_string(tags, ' ') ILIKE $1
+                LIMIT 5
+                """,
+                like_pattern,
+            )
+        ]
+        total = await conn.fetchval("SELECT COUNT(*) FROM items")
+        no_emb = await conn.fetchval("SELECT COUNT(*) FROM items WHERE embedding IS NULL")
+    return {
+        "total_items": total,
+        "no_embedding": no_emb,
+        "sem_top5": [{"title": r["title"], "dist": round(r["dist"], 3)} for r in sem_rows],
+        "sem_hits": len(sem_threshold_rows),
+        "fuzz_hits": len(fuzz_rows),
+        "fuzz_top": [{"title": r["title"], "sim": round(r["sim"], 3)} for r in fuzz_rows],
+        "like_hits": len(like_rows),
+        "like_top": [r["title"] for r in like_rows],
+    }
+
+
 async def search(
     query_text: str,
     query_embedding: list[float],
     top_k: int = 5,
 ) -> list[dict]:
+    like_pattern = f"%{query_text}%"
     async with _pool.acquire() as conn:
         sem_rows = [
             dict(r) for r in await conn.fetch(
@@ -168,6 +274,7 @@ async def search(
                        embedding <=> $1 AS dist
                 FROM items
                 WHERE embedding IS NOT NULL
+                  AND embedding <=> $1 < 0.92
                 ORDER BY dist
                 LIMIT 20
                 """,
@@ -178,16 +285,33 @@ async def search(
             dict(r) for r in await conn.fetch(
                 """
                 SELECT id, title, url, branch_path, tags, note,
-                       similarity(title || ' ' || COALESCE(note, ''), $1) AS sim
+                       word_similarity($1, title || ' ' || COALESCE(note, '') || ' ' || array_to_string(tags, ' ')) AS sim
                 FROM items
-                WHERE (title || ' ' || COALESCE(note, '')) % $1
+                WHERE $1 <% (title || ' ' || COALESCE(note, '') || ' ' || array_to_string(tags, ' '))
                 ORDER BY sim DESC
                 LIMIT 20
                 """,
                 query_text,
             )
         ]
-    results = _rrf_merge(sem_rows, fuzz_rows, top_k=top_k)
+        like_rows = [
+            dict(r) for r in await conn.fetch(
+                """
+                SELECT id, title, url, branch_path, tags, note, 0.5 AS sim
+                FROM items
+                WHERE title ILIKE $1
+                   OR COALESCE(note, '') ILIKE $1
+                   OR array_to_string(tags, ' ') ILIKE $1
+                LIMIT 20
+                """,
+                like_pattern,
+            )
+        ]
+    _log.debug(
+        "search %r: sem=%d fuzz=%d like=%d",
+        query_text, len(sem_rows), len(fuzz_rows), len(like_rows),
+    )
+    results = _rrf_merge(sem_rows, fuzz_rows + like_rows, top_k=top_k)
     return [
         {
             "id": r["id"],

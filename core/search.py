@@ -7,8 +7,9 @@ Embeddings are written at save time — no index rebuild needed.
 
 import logging
 
+import core.db as _db
 from core.ai import embed_query, embed_texts
-from core.db import search as _db_search, _pool
+from core.db import search as _db_search
 
 _log = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ async def search(query: str, wm=None, top_k: int = 5) -> list[dict]:
 
 async def build_index(wm=None) -> list[dict]:
     """Backfill embeddings for items that are missing them. Returns updated rows."""
-    async with _pool.acquire() as conn:
+    async with _db._pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT id, title, branch_path, note FROM items WHERE embedding IS NULL"
         )
@@ -37,7 +38,7 @@ async def build_index(wm=None) -> list[dict]:
     ]
     embeddings = await embed_texts(texts)
 
-    async with _pool.acquire() as conn:
+    async with _db._pool.acquire() as conn:
         await conn.executemany(
             "UPDATE items SET embedding = $1 WHERE id = $2",
             [(emb, row["id"]) for emb, row in zip(embeddings, rows)],

@@ -9,10 +9,13 @@ python bot.py
 ## Architecture
 
 ```
-bot.py              Telegram polling, duplicate guard, force-save flow, /replace command
+bot.py                        Telegram polling, duplicate guard, force-save flow, /replace command
+migrate_wisemapping_to_db.py  One-shot import of WiseMapping nodes into Postgres
+core/db.py          Postgres schema, pool, save/search/state helpers
 core/extractor.py   Input type detection, HTTP fetch, yt-dlp for YouTube, Exa fallback
 core/wisemapping.py WiseMapping JWT auth, XML read/write, node placement + move
-core/ai.py          OpenRouter call — placement, relocation, and summarization
+core/ai.py          OpenRouter call — placement, relocation, summarization, embeddings
+core/search.py      RRF merge of semantic + fuzzy search results
 ```
 
 ## Gotchas
@@ -29,4 +32,7 @@ core/ai.py          OpenRouter call — placement, relocation, and summarization
 - **Medium/paywalled extraction**: httpx 403 → escalate to Playwright with saved cookies (`medium_cookies.json`) + stealth init script to bypass Cloudflare bot detection
 - **YouTube extraction**: yt-dlp extracts title + description (channel info included); falls back to `_fetch_page` on failure
 - **/replace flow**: reply-based — bot shows numbered top-level branches, user replies with number, bot AI picks 2nd-level leaf and moves the node
-- **`_last_saved` state**: in-memory dict tracking the most recent save for `/replace` — lost on restart
+- **`_last_saved` state**: persisted to `bot_state` table in Postgres — survives restarts
+- **Search threshold**: semantic cosine distance cutoff is 0.92 (`db.py`) — was 0.75 but that was too strict for conceptually-related queries on a small dataset; tighten if the DB grows large and results get noisy
+- **`_pool` import trap**: `core/search.py` imports `core.db` as a module (`import core.db as _db`) — NOT `from core.db import _pool`. The `from ... import` form captures `None` at load time before `init_db()` runs
+- **`/searchdebug <query>`**: debug command that shows raw semantic/fuzzy/LIKE hit counts and top distances — use to diagnose why a result is missing

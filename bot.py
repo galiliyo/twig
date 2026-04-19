@@ -21,11 +21,11 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from core.extractor import extract
 from core.wisemapping import WiseMapping, WiseMappingError
 from core.ai import choose_placement, choose_relocation, summarize_bullets, embed_query
-from core.db import init_db, save_item, get_recent, get_last_saved, set_last_saved, update_item_path
+from core.db import init_db, save_item, get_recent, get_last_saved, set_last_saved, update_item_path, add_category, get_branches, get_category_paths, delete_category, count_items_under, search_debug
 from core.search import search, build_index, invalidate_index
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ async def _save_item(text: str, update: Update, context: ContextTypes.DEFAULT_TY
     wm: WiseMapping = context.bot_data["wm"]
     try:
         item = await extract(text)
-        branches = await wm.get_branches()
+        branches = await get_branches()
         placement = await choose_placement(branches, item)
 
         placement.url = item.url
@@ -311,6 +311,52 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await thinking.edit_text("\n\n".join(lines)[:4000])
 
 
+async def searchdebug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+    message = update.effective_message
+    if message is None:
+        return
+
+    query = " ".join(context.args or []).strip()
+    if not query:
+        await message.reply_text("Usage: /searchdebug <query>")
+        return
+
+    thinking = await message.reply_text("Debugging…")
+    from core.ai import embed_query
+    try:
+        q_emb = await embed_query(query)
+        info = await search_debug(query, q_emb)
+    except Exception as exc:
+        await thinking.edit_text(f"❌ Error: {exc}")
+        return
+
+    lines = [
+        f"Query: {query!r}",
+        f"DB: {info['total_items']} items, {info['no_embedding']} missing embeddings",
+        "",
+        f"Semantic hits (dist<0.75): {info['sem_hits']}",
+        "Top 5 by distance:",
+    ]
+    for r in info["sem_top5"]:
+        lines.append(f"  {r['dist']} — {r['title']}")
+    lines += [
+        "",
+        f"Fuzzy (word_similarity) hits: {info['fuzz_hits']}",
+    ]
+    for r in info["fuzz_top"]:
+        lines.append(f"  {r['sim']} — {r['title']}")
+    lines += [
+        "",
+        f"ILIKE hits: {info['like_hits']}",
+    ]
+    for t in info["like_top"]:
+        lines.append(f"  {t}")
+
+    await thinking.edit_text("\n".join(lines)[:4000])
+
+
 async def reindex_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Force-rebuild the semantic search index."""
     if update.effective_user.id != ALLOWED_USER_ID:
@@ -327,6 +373,126 @@ async def reindex_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as exc:
         log.exception("Reindex failed: %s", exc)
         await thinking.edit_text(f"❌ Reindex failed: {exc}")
+
+
+async def addcategory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Create a new category. Usage: /addcategory Parent > Child > SubChild"""
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+    message = update.effective_message
+    if message is None:
+        return
+
+    raw = " ".join(context.args or []).strip()
+    if not raw:
+        await message.reply_text("Usage: /addcategory Parent > Child > SubChild")
+        return
+
+    path = [p.strip() for p in raw.split(">") if p.strip()]
+    if not path:
+        await message.reply_text("Usage: /addcategory Parent > Child > SubChild")
+        return
+
+    wm: WiseMapping = context.bot_data["wm"]
+    await add_category(path)
+
+    # Mirror to WiseMapping
+    try:
+        xml_text = await wm._fetch_xml()
+        import xml.etree.ElementTree as ET
+        from core.wisemapping import _find_or_create_path, _assign_positions
+        root = ET.fromstring(xml_text)
+        _find_or_create_path(root, path)
+        _assign_positions(root)
+        await wm._save_xml(ET.tostring(root, encoding="unicode", xml_declaration=False))
+    except Exception as exc:
+        log.warning("WiseMapping category sync failed: %s", exc)
+
+    await message.reply_text(f"✓ Category created: {' > '.join(path)}")
+
+
+async def synctree_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sync DB categories and items from the current WiseMapping tree structure."""
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+    message = update.effective_message
+    if message is None:
+        return
+
+    thinking = await message.reply_text("Reading WiseMapping tree…")
+    wm: WiseMapping = context.bot_data["wm"]
+
+    from migrate_wisemapping_to_db import _extract_tree
+    from core.ai import embed_texts
+    import asyncpg
+
+    xml_text = await wm._fetch_xml()
+    wm_categories, wm_leaves = _extract_tree(xml_text)
+    wm_set = {tuple(p) for p in wm_categories}
+
+    db_categories = await get_category_paths()
+    db_set = {tuple(p) for p in db_categories}
+
+    to_add = [list(p) for p in sorted(wm_set - db_set)]
+    to_remove = [list(p) for p in sorted(db_set - wm_set)]
+
+    # Split removals into safe (no items) and blocked (has items underneath)
+    safe_remove, blocked_remove = [], []
+    for path in to_remove:
+        n = await count_items_under(path)
+        (blocked_remove if n else safe_remove).append((path, n))
+
+    # Apply category changes
+    for path in to_add:
+        await add_category(path)
+    for path, _ in safe_remove:
+        await delete_category(path)
+
+    # Sync items — skip URLs already in DB
+    conn = await asyncpg.connect(os.environ["DATABASE_URL"], ssl=False)
+    rows = await conn.fetch("SELECT url FROM items WHERE url IS NOT NULL")
+    await conn.close()
+    existing_urls = {r["url"] for r in rows}
+
+    new_leaves = [leaf for leaf in wm_leaves if leaf.url not in existing_urls]
+    items_added = 0
+    if new_leaves:
+        await thinking.edit_text(f"Generating embeddings for {len(new_leaves)} new items…")
+        embed_inputs = [
+            f"{' > '.join(leaf.branch_path)}: {leaf.title}".strip()
+            for leaf in new_leaves
+        ]
+        embeddings = await embed_texts(embed_inputs)
+        for leaf, embedding in zip(new_leaves, embeddings):
+            await save_item(
+                text_input=leaf.url or leaf.title,
+                title=leaf.title,
+                url=leaf.url,
+                branch_path=leaf.branch_path,
+                tags=[],
+                note=leaf.note,
+                embedding=embedding,
+            )
+        items_added = len(new_leaves)
+        invalidate_index()
+
+    lines = []
+    if to_add:
+        lines.append(f"✓ Added {len(to_add)} categories:")
+        lines.extend(f"  + {' > '.join(p)}" for p in to_add)
+    if safe_remove:
+        lines.append(f"✓ Removed {len(safe_remove)} empty categories:")
+        lines.extend(f"  - {' > '.join(p)}" for p, _ in safe_remove)
+    if blocked_remove:
+        lines.append(f"⚠️ {len(blocked_remove)} categories removed from map but skipped (have items):")
+        lines.extend(f"  ! {' > '.join(p)}  ({n} items)" for p, n in blocked_remove)
+        lines.append("  Reassign those items before removing the categories.")
+    if items_added:
+        lines.append(f"✓ Imported {items_added} new items from WiseMapping")
+    if not to_add and not safe_remove and not blocked_remove and not items_added:
+        lines.append("✓ DB already matches WiseMapping tree — nothing to do.")
+
+    await thinking.edit_text("\n".join(lines))
 
 
 async def testnote_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -486,6 +652,24 @@ async def showxml_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text(f"❌ {exc}")
 
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "*Twig Bot Commands*\n\n"
+        "/help — show this message\n"
+        "/search `<query>` — search saved nodes by keyword or meaning\n"
+        "/replace — move a node to a different branch\n"
+        "/addcategory `<name>` — add a new top-level category branch\n"
+        "/synctree — sync the WiseMapping tree from the database\n"
+        "/reindex — rebuild the semantic search index\n"
+        "/debug — show recent Postgres entries\n"
+        "/showxml — dump the last two raw XML nodes\n"
+        "/testnote — test note attachment on a node\n"
+        "/testmedium — test Medium article extraction\n\n"
+        "_Send any URL or text to save it as a node._"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("/debug received from user_id=%s (allowed=%s)", update.effective_user.id, ALLOWED_USER_ID)
     if update.effective_user.id != ALLOWED_USER_ID:
@@ -498,9 +682,9 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     wm: WiseMapping = context.bot_data["wm"]
     try:
-        branches = await wm.get_branches()
+        branches = await get_branches()
         if not branches:
-            await message.reply_text("⚠️ No branches found (empty map or parse error)")
+            await message.reply_text("⚠️ No categories found in DB")
             return
         lines = "\n".join(f"• {b}" for b in branches)
         if len(lines) > 4000:
@@ -533,8 +717,12 @@ def main() -> None:
     wm = WiseMapping()
     app.bot_data["wm"] = wm
 
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("addcategory", addcategory_command))
+    app.add_handler(CommandHandler("synctree", synctree_command))
     app.add_handler(CommandHandler("replace", replace_command))
     app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("searchdebug", searchdebug_command))
     app.add_handler(CommandHandler("reindex", reindex_command))
     app.add_handler(CommandHandler("debug", debug_command))
     app.add_handler(CommandHandler("testnote", testnote_command))
