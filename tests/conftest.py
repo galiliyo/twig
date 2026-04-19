@@ -26,10 +26,14 @@ async def _init_conn(conn: asyncpg.Connection) -> None:
 async def test_pool():
     if not TEST_DSN:
         pytest.skip("TEST_DATABASE_URL not set")
-    pool = await asyncpg.create_pool(TEST_DSN, init=_init_conn)
-    async with pool.acquire() as conn:
-        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+    # Extensions must exist before the pool starts (register_vector runs on connect)
+    setup_conn = await asyncpg.connect(TEST_DSN, ssl=False)
+    try:
+        await setup_conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        await setup_conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+    finally:
+        await setup_conn.close()
+    pool = await asyncpg.create_pool(TEST_DSN, ssl=False, init=_init_conn)
     yield pool
     await pool.close()
 

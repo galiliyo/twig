@@ -366,7 +366,7 @@ async def addcategory_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def synctree_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sync DB categories from the current WiseMapping tree structure."""
+    """Sync DB categories and items from the current WiseMapping tree structure."""
     if update.effective_user.id != ALLOWED_USER_ID:
         return
     message = update.effective_message
@@ -376,12 +376,12 @@ async def synctree_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     thinking = await message.reply_text("Reading WiseMapping tree…")
     wm: WiseMapping = context.bot_data["wm"]
 
-    from core.wisemapping import _find_or_create_path, _assign_positions
-    import xml.etree.ElementTree as ET
     from migrate_wisemapping_to_db import _extract_tree
+    from core.ai import embed_texts
+    import asyncpg
 
     xml_text = await wm._fetch_xml()
-    wm_categories, _ = _extract_tree(xml_text)
+    wm_categories, wm_leaves = _extract_tree(xml_text)
     wm_set = {tuple(p) for p in wm_categories}
 
     db_categories = await get_category_paths()
@@ -396,11 +396,39 @@ async def synctree_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         n = await count_items_under(path)
         (blocked_remove if n else safe_remove).append((path, n))
 
-    # Apply safe changes
+    # Apply category changes
     for path in to_add:
         await add_category(path)
     for path, _ in safe_remove:
         await delete_category(path)
+
+    # Sync items — skip URLs already in DB
+    conn = await asyncpg.connect(os.environ["DATABASE_URL"], ssl=False)
+    rows = await conn.fetch("SELECT url FROM items WHERE url IS NOT NULL")
+    await conn.close()
+    existing_urls = {r["url"] for r in rows}
+
+    new_leaves = [leaf for leaf in wm_leaves if leaf.url not in existing_urls]
+    items_added = 0
+    if new_leaves:
+        await thinking.edit_text(f"Generating embeddings for {len(new_leaves)} new items…")
+        embed_inputs = [
+            f"{' > '.join(leaf.branch_path)}: {leaf.title}".strip()
+            for leaf in new_leaves
+        ]
+        embeddings = await embed_texts(embed_inputs)
+        for leaf, embedding in zip(new_leaves, embeddings):
+            await save_item(
+                text_input=leaf.url or leaf.title,
+                title=leaf.title,
+                url=leaf.url,
+                branch_path=leaf.branch_path,
+                tags=[],
+                note=leaf.note,
+                embedding=embedding,
+            )
+        items_added = len(new_leaves)
+        invalidate_index()
 
     lines = []
     if to_add:
@@ -413,7 +441,9 @@ async def synctree_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         lines.append(f"⚠️ {len(blocked_remove)} categories removed from map but skipped (have items):")
         lines.extend(f"  ! {' > '.join(p)}  ({n} items)" for p, n in blocked_remove)
         lines.append("  Reassign those items before removing the categories.")
-    if not to_add and not safe_remove and not blocked_remove:
+    if items_added:
+        lines.append(f"✓ Imported {items_added} new items from WiseMapping")
+    if not to_add and not safe_remove and not blocked_remove and not items_added:
         lines.append("✓ DB already matches WiseMapping tree — nothing to do.")
 
     await thinking.edit_text("\n".join(lines))
@@ -576,6 +606,24 @@ async def showxml_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text(f"❌ {exc}")
 
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "*Twig Bot Commands*\n\n"
+        "/help — show this message\n"
+        "/search `<query>` — search saved nodes by keyword or meaning\n"
+        "/replace — move a node to a different branch\n"
+        "/addcategory `<name>` — add a new top-level category branch\n"
+        "/synctree — sync the WiseMapping tree from the database\n"
+        "/reindex — rebuild the semantic search index\n"
+        "/debug — show recent Postgres entries\n"
+        "/showxml — dump the last two raw XML nodes\n"
+        "/testnote — test note attachment on a node\n"
+        "/testmedium — test Medium article extraction\n\n"
+        "_Send any URL or text to save it as a node._"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("/debug received from user_id=%s (allowed=%s)", update.effective_user.id, ALLOWED_USER_ID)
     if update.effective_user.id != ALLOWED_USER_ID:
@@ -623,6 +671,7 @@ def main() -> None:
     wm = WiseMapping()
     app.bot_data["wm"] = wm
 
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("addcategory", addcategory_command))
     app.add_handler(CommandHandler("synctree", synctree_command))
     app.add_handler(CommandHandler("replace", replace_command))

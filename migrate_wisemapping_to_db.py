@@ -97,7 +97,7 @@ async def main() -> None:
     print("Importing categories…")
     for path in categories:
         await add_category(path)
-        print(f"  ✓ {' > '.join(path)}")
+        print(f"  +{' > '.join(path)}")
 
     if not leaves:
         print("\nDone. No notes to import.")
@@ -132,7 +132,7 @@ async def main() -> None:
                 note=None,
                 embedding=embedding,
             )
-            print(f"  ✓ {' > '.join(leaf.branch_path)} > {leaf.title}")
+            print(f"  +{' > '.join(leaf.branch_path)} > {leaf.title}")
 
     print(f"\nDone. {len(categories)} categories + {len(to_insert)} notes imported.")
 
